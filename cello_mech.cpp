@@ -51,7 +51,7 @@ float freq_c_string = freq_a_above_middle_c * pow(half_step_down, 12+21);
 
 bool start_mic()
 {
-    desired_spec.freq = 22050*2;
+    desired_spec.freq = 22050;
     desired_spec.format = AUDIO_S16SYS;
     desired_spec.channels = 1;
     desired_spec.samples = 8192;
@@ -156,11 +156,12 @@ void find_spikes()
     float threshold = 393357569101398.0f;
     bool in_spike = false;
 
-    uint32_t lowest_index = 5;
+    uint32_t lowest_index = 6;
+    uint32_t highest_index = 100;
     int num_harmonics = 6;
     float max_amp = 0;
     uint32_t max_index = 0;
-    for (uint32_t i = lowest_index; i < mic_samples / 2; ++i)
+    for (uint32_t i = lowest_index; i < mic_samples / 2 && i < highest_index; ++i)
     {
         float prod = 1.0;
         kiss_fft_cpx& c = fft_out_buffer[i];
