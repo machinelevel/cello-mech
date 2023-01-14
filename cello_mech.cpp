@@ -24,20 +24,23 @@ ej NOTE: In WSL2 if you run this and exit with ESC instead of clicking
 // typedef uint32_t u32;
 // typedef int32_t b32;
 
-#define WinWidth 1000
-#define WinHeight 1000
+#define WinWidth 500
+#define WinHeight 500
 
+const uint64_t request_num_samples = 4 * 4096;
+uint64_t actual_num_samples = 0;
 SDL_AudioSpec desired_spec;
 SDL_AudioSpec actual_spec;
 SDL_AudioDeviceID mic_id = 0;
 std::vector<int16_t> fake_wave;
-std::vector<float>   freq_spike_amp;
-std::vector<size_t>  freq_spike_index;
-int16_t mic_buffer[1024 * 1024];
-uint32_t mic_samples = 0;
+//std::vector<float>   freq_spike_amp;
+//std::vector<size_t>  freq_spike_index;
+std::vector<int16_t> mic_buffer;
 kiss_fft_cfg fft_cfg = NULL;
-kiss_fft_cpx fft_in_buffer[8192];
-kiss_fft_cpx fft_out_buffer[8192];
+std::vector<kiss_fft_cpx> fft_in_buffer;
+std::vector<kiss_fft_cpx> fft_out_buffer;
+//kiss_fft_cpx fft_in_buffer[request_num_samples];
+//kiss_fft_cpx fft_out_buffer[request_num_samples];
 float current_amp = 0;
 float current_freq = 0;
 
@@ -49,12 +52,22 @@ float freq_d_string = freq_a_above_middle_c * pow(half_step_down, 12+7);
 float freq_g_string = freq_a_above_middle_c * pow(half_step_down, 12+14);
 float freq_c_string = freq_a_above_middle_c * pow(half_step_down, 12+21);
 
+uint64_t freq_to_index(float freq)
+{
+    return 0.5f + (float)freq * ((float)actual_num_samples / (float)actual_spec.freq);
+}
+
+float index_to_freq(uint64_t index)
+{
+    return (float)index * ((float)actual_spec.freq / (float)actual_num_samples);
+}
+
 bool start_mic()
 {
     desired_spec.freq = 22050;
     desired_spec.format = AUDIO_S16SYS;
     desired_spec.channels = 1;
-    desired_spec.samples = 8192;
+    desired_spec.samples = 2 * request_num_samples;
     desired_spec.padding = 0;
     desired_spec.callback = NULL;
     desired_spec.userdata = NULL;
@@ -67,21 +80,28 @@ bool start_mic()
     printf("     channels %d\n", (int)actual_spec.channels);
     printf("      samples %d\n", (int)actual_spec.samples);
 
+    actual_num_samples = actual_spec.samples;
+    mic_buffer.resize(actual_num_samples);
+    fft_in_buffer.resize(actual_num_samples);
+    fft_out_buffer.resize(actual_num_samples);
     SDL_PauseAudioDevice(mic_id, 0);
+
+    for (uint64_t i = 0; i < 100; ++i)
+        printf("    [%d] -> %f Hz\n", (int)i, index_to_freq(i));
     return mic_id > 0;
 }
 
-void sample_mic()
+bool sample_mic()
 {
-    uint32_t bytes_received = SDL_DequeueAudio(mic_id, mic_buffer, sizeof(mic_buffer));
-    if (0 && bytes_received)
-        printf("  mic got %d bytes\n", (int)bytes_received);
-    mic_samples = bytes_received >> 1;
-    bool do_fake_data = false;
+    uint32_t bytes_received = SDL_DequeueAudio(mic_id, &mic_buffer[0], mic_buffer.size() * sizeof(mic_buffer[0]));
+    if (1 && bytes_received)
+        printf("  mic got %d samples\n", (int)bytes_received >> 1);
+    bool do_fake_data = true;
     if (do_fake_data)
     {
         float freq = 120.0f;
-        float amp = 2000.0f;
+        float amp = 4000.0f;
+        int num_harmonics = 5;
         if (fake_wave.size() == 0)
         {
             fake_wave.resize(actual_spec.samples);
@@ -89,7 +109,10 @@ void sample_mic()
             double theta_per_sample = 2 * M_PI * freq / (double)actual_spec.freq;
             for (size_t i = 0; i < fake_wave.size(); ++i)
             {
-                fake_wave[i] = amp * sin(theta);
+                float sample = 0;
+                for (int h = 1; h <= num_harmonics; ++h)
+                    sample += (1.0f / h) * amp * sin(h * theta);
+                fake_wave[i] = sample;
                 theta += theta_per_sample;
             }
             float num_waves = theta / (2 * M_PI);
@@ -97,79 +120,53 @@ void sample_mic()
             printf("There were %f waves in %f seconds = %f Hz\n", num_waves, num_seconds, num_waves / num_seconds);
         }
         // override tone
-        for (size_t i = 0; i < mic_samples; ++i)
+        for (size_t i = 0; i < actual_num_samples; ++i)
             mic_buffer[i] = fake_wave[i];
     }
+    return bytes_received > 0;
 }
 
 void init_fft()
 {
-    fft_cfg = kiss_fft_alloc(4096, 0, NULL, NULL); 
+    fft_cfg = kiss_fft_alloc(request_num_samples, 0, NULL, NULL); 
 }
 
 void do_fft()
 {
-    if (mic_samples == 0)
-        return;
     float scale = 1.0f / 32768.0f;
-    for (uint32_t i = 0; i < mic_samples; ++i)
+    for (uint32_t i = 0; i < actual_num_samples; ++i)
     {
-        fft_in_buffer[i].r = scale * mic_buffer[i] * sin(2*M_PI*(float)i/(float)mic_samples);
+        fft_in_buffer[i].r = scale * mic_buffer[i] * sin(2*M_PI*(float)i/(float)actual_num_samples);
         fft_in_buffer[i].i = 0;
     }
-    kiss_fft(fft_cfg, fft_in_buffer, fft_out_buffer);
+    kiss_fft(fft_cfg, &fft_in_buffer[0], &fft_out_buffer[0]);
 }
 
-/*
-middle c on melodian
-  spike 0: amp: 1161.894653 freq: 279.931641  strings: 110.0 164.8 246.9 370.0Hz
-  spike 1: amp: 99.829651 freq: 527.563477  strings: 110.0 164.8 246.9 370.0Hz
-  spike 2: amp: 120.500427 freq: 549.096680  strings: 110.0 164.8 246.9 370.0Hz
-  spike 3: amp: 74.641403 freq: 796.728516  strings: 110.0 164.8 246.9 370.0Hz
-  spike 4: amp: 101.067230 freq: 818.261719  strings: 110.0 164.8 246.9 370.0Hz
-  spike 5: amp: 107.670212 freq: 1356.591797  strings: 110.0 164.8 246.9 370.0Hz
-  spike 6: amp: 46.717525 freq: 1625.756836  strings: 110.0 164.8 246.9 370.0Hz
-
-a on melodian
-  spike 0: amp: 11.317676 freq: 53.833008  strings: 110.0 164.8 246.9 370.0Hz
-  spike 1: amp: 43.270077 freq: 129.199219  strings: 110.0 164.8 246.9 370.0Hz
-  spike 2: amp: 66.352959 freq: 150.732422  strings: 110.0 164.8 246.9 370.0Hz
-  spike 3: amp: 4049.396484 freq: 236.865234  strings: 110.0 164.8 246.9 370.0Hz
-  spike 4: amp: 375.277588 freq: 462.963867  strings: 110.0 164.8 246.9 370.0Hz
-  spike 5: amp: 5748.015625 freq: 689.062500  strings: 110.0 164.8 246.9 370.0Hz
-  spike 6: amp: 13.134259 freq: 893.627930  strings: 110.0 164.8 246.9 370.0Hz
-  spike 7: amp: 19.951271 freq: 915.161133  strings: 110.0 164.8 246.9 370.0Hz
-  spike 8: amp: 66.406403 freq: 1141.259766  strings: 110.0 164.8 246.9 370.0Hz
-  spike 9: amp: 74.670914 freq: 1367.358398  strings: 110.0 164.8 246.9 370.0Hz
-^
-
-440 Hz on tone generator
-  spike 0: amp: 28661.517578 freq: 430.664062  strings: 110.0 164.8 246.9 370.0Hz
-370 Hz on tone generator
-  spike 0: amp: 107.762932 freq: 376.831055  strings: 110.0 164.8 246.9 370.0Hz
-
-*/
 void find_spikes()
 {
-    freq_spike_amp.clear();
-    freq_spike_index.clear();
-    float threshold = 393357569101398.0f;
+    float threshold = 0.0f;
     bool in_spike = false;
 
-    uint32_t lowest_index = 6;
-    uint32_t highest_index = 100;
+    uint32_t lowest_index = 5;
+    uint32_t highest_index = 100000;
     int num_harmonics = 6;
     float max_amp = 0;
     uint32_t max_index = 0;
-    for (uint32_t i = lowest_index; i < mic_samples / 2 && i < highest_index; ++i)
+    float max_single_amp = 0;
+    for (uint32_t i = lowest_index; i < (actual_num_samples / 2) && (i < highest_index); ++i)
     {
         float prod = 1.0;
         kiss_fft_cpx& c = fft_out_buffer[i];
         float amp = c.r * c.r + c.i * c.i;
-        for (int h = 2; h < num_harmonics && i * h < mic_samples; ++h)
+        if (amp > max_single_amp)
+            max_single_amp = amp;
+        for (int h = 2; h <= num_harmonics && (i * h) < actual_num_samples; ++h)
         {
             kiss_fft_cpx& cc = fft_out_buffer[i * h];
-            amp *= cc.r * cc.r + cc.i * cc.i;
+            float aa = cc.r * cc.r + cc.i * cc.i;
+            amp += aa;
+            if (aa > max_single_amp)
+                max_single_amp = aa;
         }
         if (amp > max_amp)
         {
@@ -178,14 +175,23 @@ void find_spikes()
         }
     }
 
-    if (max_amp > threshold)
+    if (max_single_amp > threshold)
     {
         float amp = max_amp;
         size_t index = max_index;
 
         amp = amp * (1.0f);
-        float freq = (float)actual_spec.freq * (float)index / (float)mic_samples;
-        printf("  amp(%d): %g freq: %f  strings: %.1f %.1f %.1f %.1fHz\n", (int)max_index, amp, freq, freq_c_string, freq_g_string, freq_d_string, freq_a_string);
+        float freq = (float)actual_spec.freq * (float)index / (float)actual_num_samples;
+        printf("  amp(%d): %g max_single: %f freq: %f  strings: %.1f %.1f %.1f %.1fHz\n", (int)max_index, amp, max_single_amp, freq, freq_c_string, freq_g_string, freq_d_string, freq_a_string);
+    }
+}
+
+void do_mic_updates()
+{
+    if (sample_mic())
+    {
+        do_fft();
+        find_spikes();
     }
 }
 
@@ -216,7 +222,7 @@ void draw_pitch()
 void draw_wave()
 {
     int draw_every_n_samples = 16;
-    int samples_to_draw = mic_samples / draw_every_n_samples;
+    int samples_to_draw = actual_num_samples / draw_every_n_samples;
     samples_to_draw = 256;
     float x_scale = 1.0f / 65536;
     float y_scale = 1.0f / samples_to_draw;
@@ -235,10 +241,10 @@ void draw_wave()
 
 void draw_fft()
 {
+    int max_sample_to_draw = actual_num_samples / 16;
     int draw_every_n_samples = 16;
-    int samples_to_draw = mic_samples / draw_every_n_samples;
-    samples_to_draw = 256;
-    float x_scale = 1.0f / 20000.0f;
+    int samples_to_draw = max_sample_to_draw / draw_every_n_samples;
+    float x_scale = 1.0f / 200000.0f;
     float y_scale = 1.0f / samples_to_draw;
     glColor4f(0.0f, 0.5f, 0.0f, 1.0f);
     glBegin(GL_LINE_STRIP);
@@ -247,7 +253,7 @@ void draw_fft()
         float max_amp = 0;
         for (int j = 0; j < draw_every_n_samples; ++j)
         {
-            kiss_fft_cpx& c = fft_out_buffer[i];
+            kiss_fft_cpx& c = fft_out_buffer[i * draw_every_n_samples + j];
             float amp = c.r * c.r + c.i * c.i;
             if (max_amp < amp)
                 max_amp = amp;
@@ -282,9 +288,7 @@ int main (int ArgCount, char **Args)
   int32_t FullScreen = 0;
   while (Running)
   {
-    sample_mic();
-    do_fft();
-    find_spikes();
+    do_mic_updates();
     SDL_Event Event;
     while (SDL_PollEvent(&Event))
     {
