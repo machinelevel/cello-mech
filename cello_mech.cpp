@@ -27,11 +27,13 @@ ej NOTE: In WSL2 if you run this and exit with ESC instead of clicking
 #define WinWidth 500
 #define WinHeight 500
 
-int multibufffer = 32;
+int multibufffer = 16;
 int multibufffer_pos = 0;
 const uint64_t request_num_samples = 4 * 4096;
 uint64_t frame_num_samples = 0;
 uint64_t total_num_samples = 0;
+std::vector<float> frame_cos_scale;
+std::vector<float> total_cos_scale;
 SDL_AudioSpec desired_spec;
 SDL_AudioSpec actual_spec;
 SDL_AudioDeviceID mic_id = 0;
@@ -42,6 +44,7 @@ std::vector<kiss_fft_cpx> fft_in_buffer;
 std::vector<kiss_fft_cpx> fft_out_buffer;
 float current_amp = 0;
 float current_freq = 0;
+int current_string = -1;
 
 double freq_a_above_middle_c = 440;
 double half_step_up = pow(2, 1.0/12.0);
@@ -84,6 +87,13 @@ bool start_mic()
     mic_buffer.resize(total_num_samples);
     fft_in_buffer.resize(total_num_samples);
     fft_out_buffer.resize(total_num_samples);
+    frame_cos_scale.resize(frame_num_samples);
+    total_cos_scale.resize(total_num_samples);
+    for (uint64_t i = 0; i < frame_num_samples; ++i)
+        frame_cos_scale[frame_num_samples - i - 1] = 1.0f - cos(1*M_PI*(float)i/(float)frame_num_samples);
+    for (uint64_t i = 0; i < total_num_samples; ++i)
+        total_cos_scale[i] = 1.0f - cos(2*M_PI*(float)i/(float)total_num_samples);
+
     SDL_PauseAudioDevice(mic_id, 0);
 
     for (uint64_t i = 0; i < 100; ++i)
@@ -100,9 +110,9 @@ bool sample_mic()
     if (do_fake_data)
     {
 //        float freq = 65.0f;
-//        float freq = 98.0f;
+        float freq = 98.0f;
 //        float freq = 147.0f;
-        float freq = 220.0f;
+//        float freq = 220.0f;
         float amp = 4000.0f;
         int num_harmonics = 5;
         if (fake_wave.size() == 0)
@@ -114,7 +124,7 @@ bool sample_mic()
             {
                 float sample = 0;
                 for (int h = 1; h <= num_harmonics; ++h)
-                    sample += (1.0f / h) * amp * sin(h * theta);
+                    sample += (1.0f / (2*h)) * amp * sin(h * theta);
                 fake_wave[i] = sample;
                 theta += theta_per_sample;
             }
@@ -140,7 +150,7 @@ void do_fft()
     float scale = 1.0f / 32768.0f;
     for (uint32_t i = 0; i < total_num_samples; ++i)
     {
-        fft_in_buffer[i].r = scale * mic_buffer[i] * (1.0f - cos(2*M_PI*(float)i/(float)total_num_samples));
+        fft_in_buffer[i].r = scale * mic_buffer[i] * total_cos_scale[i];
         fft_in_buffer[i].i = 0;
     }
     kiss_fft(fft_cfg, &fft_in_buffer[0], &fft_out_buffer[0]);
@@ -179,12 +189,22 @@ void find_spikes()
         }
     }
 
+    current_string = -1;
     if (max_single_amp > threshold)
     {
         size_t index = max_index;
         current_amp = max_amp;
         current_freq = (float)actual_spec.freq * (float)index / (float)total_num_samples;
         printf("  amp(%d): %g max_single: %f freq: %f  strings: %.1f %.1f %.1f %.1fHz\n", (int)max_index, current_amp, max_single_amp, current_freq, freq_c_string, freq_g_string, freq_d_string, freq_a_string);
+
+        if (current_freq < freq_g_string * half_step_down)
+            current_string = 0;
+        else if (current_freq < freq_d_string * half_step_down)
+            current_string = 1;
+        else if (current_freq < freq_a_string * half_step_down)
+            current_string = 2;
+        else
+            current_string = 3;
     }
 }
 
@@ -210,14 +230,14 @@ void draw_strings()
 
     glColor4f(0.5f, 0.5f, 0.5f, 1.0f);
     glBegin(GL_LINES);
-    glVertex3f(-0.2f, -1.0f, 0.0f);
-    glVertex3f(-0.2f,  1.0f, 0.0f);
-    glVertex3f(-0.3f, -1.0f, 0.0f);
-    glVertex3f(-0.3f,  1.0f, 0.0f);
-    glVertex3f(-0.4f, -1.0f, 0.0f);
-    glVertex3f(-0.4f,  1.0f, 0.0f);
-    glVertex3f(-0.5f, -1.0f, 0.0f);
-    glVertex3f(-0.5f,  1.0f, 0.0f);
+    for (int s = 0; s < 4; ++s)
+    {
+        if (s != current_string)
+        {
+            glVertex3f(-0.5f + 0.1f * s, -1.0f, 0.0f);
+            glVertex3f(-0.5f + 0.1f * s,  1.0f, 0.0f);
+        }
+    }
     glEnd();
 }
 
@@ -232,24 +252,21 @@ void draw_pitch()
 
 void draw_wave()
 {
+    if (current_string < 0)
+        return;
     int draw_every_n_samples = 16;
-    int samples_to_draw = total_num_samples / draw_every_n_samples;
-    float x_scale = 1.0f / 8.0f;
-    float y_scale = 2.0f / samples_to_draw;
+    int samples_to_draw = frame_num_samples / draw_every_n_samples;
+    float x_scale = 1.0f / 300000.0f;
+    float y_scale = 2.1f / samples_to_draw;
     float string_offset = 0;
-    if (current_freq < freq_g_string * half_step_down)
-        string_offset = -0.5f;
-    else if (current_freq < freq_d_string * half_step_down)
-        string_offset = -0.4f;
-    else if (current_freq < freq_a_string * half_step_down)
-        string_offset = -0.3f;
-    else
-        string_offset = -0.2f;
+    string_offset = -0.5f + 0.1f * current_string;
     glColor4f(0.0f, 0.5f, 0.0f, 1.0f);
+    glColor4f(0.8f, 1.0f, 0.8f, 1.0f);
     glBegin(GL_LINE_STRIP);
     for (int32_t i = 0; i < samples_to_draw; ++i)
     {
-        float x = x_scale * fft_in_buffer[i * draw_every_n_samples].r + string_offset;
+        float wave_val = (float)mic_buffer[multibufffer_pos * frame_num_samples + i * draw_every_n_samples];
+        float x = x_scale * wave_val * frame_cos_scale[i * draw_every_n_samples] + string_offset;
         float y = y_scale * (i - (samples_to_draw >> 1));
         glVertex3f(x, y, 0.0f);
     }
